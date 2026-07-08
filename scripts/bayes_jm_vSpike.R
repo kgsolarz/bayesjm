@@ -618,22 +618,22 @@ sample_alpha <- function(alpha_curr, beta, T, delta, X, gamma, lambda, u, int_bo
   lsurv_curr <- lsurv_all(T, delta, X, alpha_curr, beta, gamma, lambda, u, int_bounds, k_T)
   
   for (j in 1:p) {
-    alpha_prop[j] <- rnorm(1, mean = alpha_curr[j], sd = Sigma_prop_alpha[j, j]) 
-    
+    alpha_prop[j] <- rnorm(1, mean = alpha_curr[j], sd = Sigma_prop_alpha[j, j])
+
     # Compute log-posterior at current value
-    lsurv_curr <- lsurv_curr
     lprior_curr <- dnorm(alpha_curr[j], mean = mu_alpha[j], sd = Sigma_alpha[j, j], log = TRUE)
     lpost_curr <- lsurv_curr + lprior_curr
-    
+
     # Compute log-posterior at proposal value
     lsurv_prop <- lsurv_all(T, delta, X, alpha_prop, beta, gamma, lambda, u, int_bounds, k_T)
     lprior_prop <- dnorm(alpha_prop[j], mean = mu_alpha[j], sd = Sigma_alpha[j, j], log = TRUE)
     lpost_prop = lsurv_prop + lprior_prop
-    
+
     # Accept/reject
     log_ratio <- lpost_prop - lpost_curr
     if (log(runif(1)) < log_ratio) {
       alpha_curr[j] = alpha_prop[j]
+      lsurv_curr <- lsurv_prop  # propagate updated log-surv density to next component
     } else {
       alpha_prop[j] = alpha_curr[j]
     }

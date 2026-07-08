@@ -311,7 +311,266 @@ arma::mat rwishRcpp(double nu0, arma::mat const& S0) {
   }
   arma::mat AL = A * L;
   return arma::trans(AL) * AL;
-} 
+}
+
+// [[Rcpp::export]]
+arma::mat sample_Sigma_beta_cpp(double nu0,
+                                const arma::mat& S0,
+                                const arma::mat& beta,
+                                const arma::vec& mu_beta) {
+  int N = beta.n_rows;
+
+  arma::mat Smu(2, 2, arma::fill::zeros);
+
+  for (int i = 0; i < N; i++) {
+    arma::vec beta_i = arma::trans(beta.row(i).cols(0, 1));  // [beta0_i, beta1_i]
+    arma::vec diff = beta_i - mu_beta;
+    Smu += diff * diff.t();
+  }
+
+  return arma::inv(rwishRcpp(nu0 + N, arma::inv(S0 + Smu)));
+}
+
+// [[Rcpp::export]]
+double sample_sigma_sq_cpp(double a, double b,
+                           const arma::mat& beta,
+                           const arma::field<arma::vec>& Y,
+                           const arma::field<arma::vec>& t,
+                           const arma::field<arma::vec>& kappa,
+                           double max_t = 6.01) {
+
+  int N = Y.n_elem;
+
+  double total_n = 0.0;
+  for (int i = 0; i < N; i++) total_n += static_cast<double>(Y(i).n_elem);
+
+  double shape = a + (0.5 * total_n);
+
+  double sum_resids = 0.0;
+
+  for (int i = 0; i < N; i++) {
+    const arma::vec& y_i = Y(i);
+    const arma::vec& t_i = t(i);
+    const arma::vec& kappa_i = kappa(i);
+
+    double b0 = beta(i, 0);
+    double b1 = beta(i, 1);
+    double b2 = beta(i, 2);
+
+    arma::vec psi_i = (b0 + kappa_i * b2) + b1 * t_i;
+    arma::vec resid = y_i - psi_i;
+
+    sum_resids += arma::dot(resid, resid);
+  }
+
+  double rate = (.5 * sum_resids) + b;
+
+  // R's rgamma(n, shape, rate) uses rate parameterization; R::rgamma() takes (shape, scale)
+  double sigma_sq = 1.0 / R::rgamma(shape, 1.0 / rate);
+
+  return sigma_sq;
+}
+
+// [[Rcpp::export]]
+double sample_lambda_k_cpp(int k,
+                           const arma::vec& u,
+                           const arma::vec& T,
+                           const arma::ivec& delta,
+                           const arma::mat& X,
+                           const arma::vec& alpha,
+                           const arma::mat& beta,
+                           double gamma,
+                           const Rcpp::List& int_bounds,
+                           double a_k,
+                           double b_k,
+                           double max_t = 6.01) {
+
+  // k is 1-based (as in R)
+  double u_lower = u(k - 1);
+  double u_upper = u(k);
+
+  int N = X.n_rows;
+
+  int n_k = 0;
+  for (int i = 0; i < N; i++) {
+    if (delta(i) == 1 && T(i) >= u_lower && T(i) < u_upper) {
+      n_k++;
+    }
+  }
+
+  double total_integral = 0.0;
+
+  for (int i = 0; i < N; i++) {
+    double T_i = T(i);
+    if (T_i < u_lower) continue;
+
+    arma::rowvec X_i = X.row(i);
+    double X_i_alpha = arma::as_scalar(X_i * alpha);
+
+    double b0 = beta(i, 0);
+    double b1 = beta(i, 1);
+
+    Rcpp::List patient_bounds = int_bounds[i];
+    arma::mat blocks = Rcpp::as<arma::mat>(patient_bounds[k - 1]);
+
+    if (blocks.n_rows == 0) continue;
+
+    arma::vec LB = blocks.col(0);
+    arma::vec UB = blocks.col(1);
+
+    if (std::abs(gamma * b1) < 1e-6) {
+      total_integral += std::exp(X_i_alpha + gamma * b0) * arma::accu(UB - LB);
+    } else {
+      arma::vec piece = (arma::exp(gamma * b1 * UB) - arma::exp(gamma * b1 * LB)) / (gamma * b1);
+      total_integral += std::exp(X_i_alpha + gamma * b0) * arma::accu(piece);
+    }
+  }
+
+  double shape_post = a_k + n_k;
+  double rate_post = std::max(b_k + total_integral, DBL_MIN);
+
+  double lambda_k = R::rgamma(shape_post, 1.0 / rate_post);
+
+  return lambda_k;
+}
+
+// [[Rcpp::export]]
+double lsurv_all_cpp(const arma::vec& T,
+                     const arma::ivec& delta,
+                     const arma::mat& X,
+                     const arma::vec& alpha,
+                     const arma::mat& beta,
+                     double gamma,
+                     const arma::vec& lambda,
+                     const arma::vec& u,
+                     const Rcpp::List& int_bounds,
+                     const arma::ivec& k_T) {
+
+  int N = T.n_elem;
+  double total_log_density = 0.0;
+
+  for (int i = 0; i < N; i++) {
+    arma::field<arma::mat> int_bounds_i = Rcpp::as<arma::field<arma::mat>>(int_bounds[i]);
+
+    double li = lsurv_i_cpp(
+      T(i),
+      delta(i),
+      X.row(i),
+      alpha,
+      arma::vec(beta.row(i).t()),
+      gamma,
+      lambda,
+      u,
+      int_bounds_i,
+      k_T(i)
+    );
+
+    if (!std::isfinite(li)) {
+      Rcpp::Rcout << "Non-finite ll at i = " << (i + 1) << "\n";
+    }
+
+    total_log_density += li;
+  }
+
+  return total_log_density;
+}
+
+// [[Rcpp::export]]
+arma::vec sample_alpha_cpp(arma::vec alpha_curr,
+                           const arma::mat& beta,
+                           const arma::vec& T,
+                           const arma::ivec& delta,
+                           const arma::mat& X,
+                           double gamma,
+                           const arma::vec& lambda,
+                           const arma::vec& u,
+                           const Rcpp::List& int_bounds,
+                           const arma::ivec& k_T,
+                           const arma::vec& mu_alpha,
+                           const arma::mat& Sigma_alpha,
+                           const arma::mat& Sigma_prop_alpha) {
+
+  int p = alpha_curr.n_elem;
+  arma::vec alpha_prop = alpha_curr;
+
+  double lsurv_curr = lsurv_all_cpp(T, delta, X, alpha_curr, beta, gamma, lambda, u, int_bounds, k_T);
+
+  for (int j = 0; j < p; j++) {
+    alpha_prop(j) = R::rnorm(alpha_curr(j), Sigma_prop_alpha(j, j));
+
+    double lprior_curr = R::dnorm(alpha_curr(j), mu_alpha(j), Sigma_alpha(j, j), true);
+    double lpost_curr = lsurv_curr + lprior_curr;
+
+    double lsurv_prop = lsurv_all_cpp(T, delta, X, alpha_prop, beta, gamma, lambda, u, int_bounds, k_T);
+    double lprior_prop = R::dnorm(alpha_prop(j), mu_alpha(j), Sigma_alpha(j, j), true);
+    double lpost_prop = lsurv_prop + lprior_prop;
+
+    double log_ratio = lpost_prop - lpost_curr;
+    if (std::log(R::runif(0, 1)) < log_ratio) {
+      alpha_curr(j) = alpha_prop(j);
+      lsurv_curr = lsurv_prop;  // propagate updated log-surv density to next component
+    } else {
+      alpha_prop(j) = alpha_curr(j);
+    }
+  }
+
+  return alpha_curr;
+}
+
+// [[Rcpp::export]]
+double sample_gamma_cpp(double gamma_curr,
+                        const arma::mat& beta,
+                        const arma::vec& T,
+                        const arma::ivec& delta,
+                        const arma::mat& X,
+                        const arma::vec& alpha,
+                        const arma::vec& lambda,
+                        const arma::vec& u,
+                        const Rcpp::List& int_bounds,
+                        const arma::ivec& k_T,
+                        double mu_gamma,
+                        double sigma_sq_gamma,
+                        double sigma_sq_prop) {
+
+  double gamma_prop = R::rnorm(gamma_curr, std::sqrt(sigma_sq_prop));
+
+  double lsurv_curr = lsurv_all_cpp(T, delta, X, alpha, beta, gamma_curr, lambda, u, int_bounds, k_T);
+  double lprior_curr = R::dnorm(gamma_curr, mu_gamma, std::sqrt(sigma_sq_gamma), true);
+  double lpost_curr = lsurv_curr + lprior_curr;
+
+  double lsurv_prop = lsurv_all_cpp(T, delta, X, alpha, beta, gamma_prop, lambda, u, int_bounds, k_T);
+  double lprior_prop = R::dnorm(gamma_prop, mu_gamma, std::sqrt(sigma_sq_gamma), true);
+  double lpost_prop = lsurv_prop + lprior_prop;
+
+  double log_ratio = lpost_prop - lpost_curr;
+
+  if (std::log(R::runif(0, 1)) < log_ratio) {
+    return gamma_prop;
+  } else {
+    return gamma_curr;
+  }
+}
+
+// [[Rcpp::export]]
+double pilot_adapt_cpp(double tuning_param, double accept_rate) {
+
+  // adjust tuning parameter by scaling existing parameter based on current acceptance rate
+  if (accept_rate >= 0.90) {
+    tuning_param = tuning_param * 1.3;
+  } else if ((accept_rate >= 0.75) && (accept_rate < 0.90)) {
+    tuning_param = tuning_param * 1.2;
+  } else if ((accept_rate >= 0.45) && (accept_rate < 0.75)) {
+    tuning_param = tuning_param * 1.1;
+  } else if ((accept_rate <= 0.25) && (accept_rate > 0.15)) {
+    tuning_param = tuning_param * 0.9;
+  } else if ((accept_rate <= 0.15) && (accept_rate > 0.10)) {
+    tuning_param = tuning_param * 0.8;
+  } else if (accept_rate <= 0.10) {
+    tuning_param = tuning_param * 0.7;
+  }
+
+  return tuning_param;
+}
 
 
 // You can include R code blocks in C++ files processed with sourceCpp
@@ -397,6 +656,70 @@ S0 <- matrix(c(1.0, 0.3, 0.3, 0.8), nrow = 2)
 
 rwishRcpp(nu0, S0)
 
+beta <- matrix(c(4.0, 3.8, 4.2, -0.3, -0.5, -0.2, 1.0, 0.5, -1.0), nrow = 3, ncol = 3)
+mu_beta <- c(4.0, -0.3)
 
+sample_Sigma_beta_cpp(nu0, S0, beta, mu_beta)
+
+Y_field <- list(c(5.2, 4.8, 4.5), c(6.0, 5.5))
+t_field <- list(c(0, 1, 2), c(0, 1))
+kappa_field <- list(c(0, 0, 1), c(0, 1))
+beta_sig <- matrix(c(4.0, 5.0, -0.3, -0.5, 1.0, 0.5), nrow = 2, ncol = 3)
+a <- 0.001
+b <- 0.001
+
+sample_sigma_sq_cpp(a, b, beta_sig, Y_field, t_field, kappa_field)
+
+u <- c(0, 2, 4, 6)
+T_vec <- c(5.0, 3.0)
+delta_vec <- c(1L, 0L)
+X_mat <- matrix(c(1, 1, 0.5, -0.2, -0.3, 0.1), nrow = 2, ncol = 3)
+alpha_vec <- c(0.2, -0.1, 0.15)
+beta_lam <- matrix(c(4.0, 3.5, -0.3, -0.4, 1.0, 0.0), nrow = 2, ncol = 3)
+gamma_val <- 0.8
+a_k <- 0.001
+b_k <- 0.001
+
+int_bounds_list <- list(
+  list(
+    matrix(c(0, 1, 1, 2), ncol = 2, dimnames = list(NULL, c("LB", "UB"))),
+    matrix(c(2, 3, 3, 4), ncol = 2, dimnames = list(NULL, c("LB", "UB"))),
+    matrix(c(4, 5), ncol = 2, dimnames = list(NULL, c("LB", "UB")))
+  ),
+  list(
+    matrix(c(0, 1), ncol = 2, dimnames = list(NULL, c("LB", "UB"))),
+    matrix(ncol = 2, nrow = 0, dimnames = list(NULL, c("LB", "UB"))),
+    matrix(ncol = 2, nrow = 0, dimnames = list(NULL, c("LB", "UB")))
+  )
+)
+
+sample_lambda_k_cpp(1, u, T_vec, delta_vec, X_mat, alpha_vec, beta_lam, gamma_val,
+                    int_bounds_list, a_k, b_k)
+
+k_T_vec <- c(3L, 2L)
+
+lsurv_all_cpp(T_vec, delta_vec, X_mat, alpha_vec, beta_lam, gamma_val, lambda,
+             u, int_bounds_list, k_T_vec)
+
+mu_alpha_vec <- c(0, 0, 0)
+Sigma_alpha_mat <- diag(100, 3)
+Sigma_prop_alpha_mat <- diag(0.1, 3)
+
+sample_alpha_cpp(alpha_vec, beta_lam, T_vec, delta_vec, X_mat, gamma_val, lambda,
+                 u, int_bounds_list, k_T_vec, mu_alpha_vec, Sigma_alpha_mat, Sigma_prop_alpha_mat)
+
+mu_gamma_val <- 0
+sigma_sq_gamma_val <- 1
+sigma_sq_prop_val <- 0.001
+
+sample_gamma_cpp(gamma_val, beta_lam, T_vec, delta_vec, X_mat, alpha_vec, lambda,
+                 u, int_bounds_list, k_T_vec, mu_gamma_val, sigma_sq_gamma_val, sigma_sq_prop_val)
+
+pilot_adapt_cpp(0.1, 0.95)
+pilot_adapt_cpp(0.1, 0.80)
+pilot_adapt_cpp(0.1, 0.50)
+pilot_adapt_cpp(0.1, 0.20)
+pilot_adapt_cpp(0.1, 0.12)
+pilot_adapt_cpp(0.1, 0.05)
 
 */
